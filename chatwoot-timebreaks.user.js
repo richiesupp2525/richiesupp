@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chatwoot Status: Day Plan (v5 design)
 // @namespace    sparkmoth
-// @version      5.3
+// @version      5.6
 // @description  План ТБ и обеда, авто-"Занят" за 5 минут до начала, уведомления рядом с окном. Новый дизайн.
 // @match        https://sparkmoth.com/app/*
 // @grant        none
@@ -11,11 +11,12 @@
 (function () {
   "use strict";
 
-  const VERSION = "5.3"; // держите в синхроне со строкой @version выше
+  const VERSION = "5.6"; // держите в синхроне со строкой @version выше
 
   // ===== НАСТРОЙКИ =====
   const LEAD_MIN = 5;      // за сколько минут до начала переходить в «Занят»
   const BREAK_MIN = 10;    // длительность перерыва
+  const SHIFT_GUARD_MIN = 30; // за сколько минут до конца смены нельзя брать ТБ и обед
   const LUNCH_MIN = 60;    // длительность обеда
   const FIRE_EARLY_SEC = 10; // запрос отправляется заранее, чтобы статус уже был «Занят» ровно за 5 минут (после первой смены подстраивается сам)
   const TOAST_MS = 20000;  // сколько показывать уведомление
@@ -147,7 +148,11 @@
     };
     (plan.b || []).forEach((t, i) => mk("b" + i, "break", "ТБ " + (i + 1), t, BREAK_MIN));
     mk("l", "lunch", "Обед", plan.l, LUNCH_MIN);
-    return out.sort((a, b) => a.start - b.start);
+    mk("e", "shift", "Конец смены", plan.e, 0);
+    out.sort((a, b) => a.start - b.start);
+    const shift = out.find((e) => e.type === "shift");
+    if (shift) out.forEach((e) => { if (e.type !== "shift" && e.start >= shift.start - SHIFT_GUARD_MIN * 60000) e.blocked = true; });
+    return out;
   }
   function getState() {
     const day = new Date().toDateString();
@@ -162,7 +167,19 @@
     const now = Date.now();
     for (const e of evs) {
       const end = e.start + e.dur * 60000;
+      if (e.blocked) continue; // за 3 минуты до конца смены ТБ и обед брать нельзя
       const s = st.done[e.id] || (st.done[e.id] = {});
+      if (e.type === "shift") {
+        // Конец смены: «Занят» именно в указанное время (без 5 минут), возврата в «В сети» нет
+        if (!s.busy && now >= e.start && now < e.start + 3 * 60000) {
+          s.busy = true; s.end = true; write(LS_STATE, st);
+          lastLag = now - e.start; lastEarly = 0;
+          toast("🏁 Конец смены (" + hhmm(e.start) + "). Перехожу в «Занят»", "busy");
+          await safe("busy");
+          return true;
+        }
+        continue;
+      }
       const early = earlyMs();
       const fireAt = e.start - LEAD_MIN * 60000 - early;
       if (!s.busy && now >= fireAt && now < end) {
@@ -176,7 +193,7 @@
       if (now >= end && !s.end) {
         s.end = true; write(LS_STATE, st);
         lastLag = now - end; lastEarly = 0;
-        const nextSoon = evs.some((o) => o !== e && now >= o.start - LEAD_MIN * 60000 && now < o.start + o.dur * 60000);
+        const nextSoon = evs.some((o) => o !== e && o.type !== "shift" && !o.blocked && now >= o.start - LEAD_MIN * 60000 && now < o.start + o.dur * 60000);
         if (s.busy && read(LS_RETURN, true) && !nextSoon) {
           toast("✅ " + e.label + " закончился. Возвращаю «В сети»", "ok");
           await safe("online");
@@ -249,6 +266,7 @@
   .cwdp-cell:focus-within{border-color:rgba(129,140,248,.7)}
   .cwdp-cell.wide{grid-column:1/-1}
   .cwdp-dot{width:8px;height:8px;border-radius:50%;flex:none;background:#60a5fa;box-shadow:0 0 8px #60a5fa88}
+  .cwdp-dot.s{background:#f472b6;box-shadow:0 0 8px #f472b688}
   .cwdp-dot.l{background:#a78bfa;box-shadow:0 0 8px #a78bfa88}
   .cwdp-cell span{flex:1;min-width:0;font-size:12px;color:#c4c4d0;white-space:nowrap}
   .cwdp input[type=time],.cwdp input[type=number]{all:unset!important;box-sizing:border-box!important;display:block!important;background:transparent!important;border:0!important;box-shadow:none!important;outline:0!important;margin:0!important;height:auto!important;min-width:0!important;max-width:100%!important;color:#fff!important;font:600 12.5px ui-monospace,Menlo,Consolas,monospace!important;color-scheme:dark;padding:2px 0!important;width:auto!important;text-align:right!important;cursor:text}
@@ -266,6 +284,9 @@
   .cwdp-row{display:flex;align-items:center;gap:10px;padding:7px 9px;border-radius:10px;margin-bottom:5px;background:rgba(255,255,255,.04);border:1px solid transparent;transition:opacity .3s}
   .cwdp-row.now{background:rgba(245,158,11,.14);border-color:rgba(245,158,11,.4)}
   .cwdp-row.soon{background:rgba(129,140,248,.14);border-color:rgba(129,140,248,.4)}
+  .cwdp-row.blocked{background:rgba(248,113,113,.08);border-color:rgba(248,113,113,.35)}
+  .cwdp-row.blocked .cwdp-rt span{color:#fca5a5}
+  .cwdp-row.blocked .cwdp-chip{background:rgba(248,113,113,.25);color:#fecaca}
   .cwdp-row.done{opacity:.4}
   .cwdp-ico{font-size:15px;width:20px;text-align:center}
   .cwdp-rt{flex:1;min-width:0}
@@ -312,7 +333,7 @@
   // ---------- Разметка ----------
   const svgClock = '<svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
   const svgChev = '<svg class="cwdp-chev" viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
-  const cell = (i, label, lunch) => `<label class="cwdp-cell${lunch ? " wide" : ""}"><i class="cwdp-dot${lunch ? " l" : ""}"></i><span>${label}</span><input id="p${i}" type="time"></label>`;
+  const cell = (i, label, kind) => `<label class="cwdp-cell${kind ? " wide" : ""}"><i class="cwdp-dot${kind === "shift" ? " s" : kind ? " l" : ""}"></i><span>${label}</span><input id="p${i}" type="time"></label>`;
 
   const box = document.createElement("div");
   box.className = "cwdp";
@@ -340,7 +361,7 @@
 
       <div class="cwdp-sec">Время на день</div>
       <div class="cwdp-grid">
-        ${cell(0, "ТБ 1")}${cell(1, "ТБ 2")}${cell(2, "ТБ 3")}${cell(3, "ТБ 4")}${cell(4, "Обед", true)}
+        ${cell(0, "ТБ 1")}${cell(1, "ТБ 2")}${cell(2, "ТБ 3")}${cell(3, "ТБ 4")}${cell(4, "Обед", true)}${cell(5, "Конец смены", "shift")}
       </div>
       <div class="cwdp-btns">
         <button class="cwdp-btn p" id="save">Сохранить</button>
@@ -454,19 +475,24 @@
 
   // ---------- План ----------
   const plan = read(LS_PLAN, null);
-  if (plan) { (plan.b || []).forEach((t, i) => ($("p" + i).value = t || "")); $("p4").value = plan.l || ""; }
+  if (plan) { (plan.b || []).forEach((t, i) => ($("p" + i).value = t || "")); $("p4").value = plan.l || ""; $("p5").value = plan.e || ""; }
   $("save").onclick = () => {
     const b = [0, 1, 2, 3].map((i) => $("p" + i).value || "");
     const l = $("p4").value || "";
-    write(LS_PLAN, { b, l });
+    const e5 = $("p5").value || "";
+    write(LS_PLAN, { b, l, e: e5 });
     write(LS_STATE, null);
-    const n = b.filter(Boolean).length + (l ? 1 : 0);
-    toast("📋 План сохранён: " + n + " пункт(ов). «Занят» включится за " + LEAD_MIN + " мин до начала", "ok");
+    const n = b.filter(Boolean).length + (l ? 1 : 0) + (e5 ? 1 : 0);
+    const bad = todayEvents().filter((x) => x.blocked);
+    if (bad.length) {
+      toast("⚠️ За " + SHIFT_GUARD_MIN + " мин до конца смены ТБ и обед брать нельзя. Не сработают: " + bad.map((x) => x.label + " (" + hhmm(x.start) + ")").join(", "), "err");
+    } else
+    toast("📋 План сохранён: " + n + " пункт(ов). «Занят» включится за " + LEAD_MIN + " мин до начала" + (e5 ? ", а в " + e5 + " (конец смены) — ровно в это время" : ""), "ok");
     renderList(true);
   };
   $("clear").onclick = () => {
     write(LS_PLAN, null); write(LS_STATE, null);
-    [0, 1, 2, 3, 4].forEach((i) => ($("p" + i).value = ""));
+    [0, 1, 2, 3, 4, 5].forEach((i) => ($("p" + i).value = ""));
     toast("План очищен");
     renderList(true);
   };
@@ -478,27 +504,27 @@
   function renderList(force) {
     const evs = todayEvents();
     const now = Date.now();
-    const sig = evs.map((e) => e.id + e.start).join("|");
+    const sig = evs.map((e) => e.id + e.start + (e.blocked ? "x" : "")).join("|");
     if (force || sig !== lastSig) {
       lastSig = sig;
       $("tl").innerHTML = evs.length
-        ? evs.map((e) => `<div class="cwdp-row" data-id="${e.id}"><div class="cwdp-ico">${e.type === "lunch" ? "🍽" : "☕"}</div>
-            <div class="cwdp-rt"><b>${e.label}</b><span>${hhmm(e.start)} – ${hhmm(e.start + e.dur * 60000)}</span></div>
+        ? evs.map((e) => `<div class="cwdp-row" data-id="${e.id}"><div class="cwdp-ico">${e.type === "lunch" ? "🍽" : e.type === "shift" ? "🏁" : "☕"}</div>
+            <div class="cwdp-rt"><b>${e.label}</b><span>${e.blocked ? "Нельзя: меньше " + SHIFT_GUARD_MIN + " мин до конца смены" : e.type === "shift" ? "«Занят» в " + hhmm(e.start) : hhmm(e.start) + " – " + hhmm(e.start + e.dur * 60000)}</span></div>
             <div class="cwdp-chip"></div></div>`).join("")
         : `<div class="cwdp-empty">Укажите время и нажмите «Сохранить»</div>`;
     }
     for (const e of evs) {
       const row = box.querySelector(`.cwdp-row[data-id="${e.id}"]`);
       if (!row) continue;
-      const end = e.start + e.dur * 60000, pre = e.start - LEAD_MIN * 60000;
-      const state = now >= end ? "done" : now >= e.start ? "now" : now >= pre ? "soon" : "wait";
+      const end = e.start + e.dur * 60000, pre = e.start - (e.type === "shift" ? 0 : LEAD_MIN * 60000);
+      const state = e.blocked ? "blocked" : now >= end ? "done" : now >= e.start ? "now" : now >= pre ? "soon" : "wait";
       row.className = "cwdp-row " + state;
-      row.querySelector(".cwdp-chip").textContent = { done: "Готово", now: "Идёт", soon: "Скоро", wait: "Ожидает" }[state];
+      row.querySelector(".cwdp-chip").textContent = { done: "Готово", now: "Идёт", soon: "Скоро", wait: "Ожидает", blocked: "Нельзя" }[state];
     }
 
     // Hero
     const hero = $("hero");
-    const cur = evs.find((e) => now < e.start + e.dur * 60000);
+    const cur = evs.find((e) => !e.blocked && now < e.start + e.dur * 60000);
     if (!evs.length) {
       hero.className = "cwdp-hero idle";
       $("hl").textContent = "План не задан"; $("hn").textContent = "Добавьте время ТБ"; $("hc").textContent = "--:--"; $("hb").style.width = "0";
@@ -507,6 +533,13 @@
       hero.className = "cwdp-hero idle";
       $("hl").textContent = "На сегодня всё"; $("hn").textContent = "Все ТБ позади"; $("hc").textContent = "✓"; $("hb").style.width = "100%";
       $("sub").textContent = "Все ТБ позади";
+    } else if (cur.type === "shift") {
+      hero.className = "cwdp-hero";
+      $("hl").textContent = "До конца смены";
+      $("hn").textContent = "🏁 Конец смены · " + hhmm(cur.start) + " · «Занят»";
+      $("hc").textContent = fmt(cur.start - now);
+      $("hb").style.width = clamp01(1 - (cur.start - now) / (4 * 3600000)) * 100 + "%";
+      $("sub").textContent = "Конец смены в " + hhmm(cur.start);
     } else {
       const end = cur.start + cur.dur * 60000, pre = cur.start - LEAD_MIN * 60000;
       const name = (cur.type === "lunch" ? "🍽 " : "☕ ") + cur.label + " · " + hhmm(cur.start);
@@ -536,7 +569,7 @@
     let lt = "Перерывчики", busyNow = false;
     if (evs.length && !cur) lt = "ТБ ✓";
     else if (cur) {
-      const pre2 = cur.start - LEAD_MIN * 60000, end2 = cur.start + cur.dur * 60000;
+      const pre2 = cur.start - (cur.type === "shift" ? 0 : LEAD_MIN * 60000), end2 = cur.start + cur.dur * 60000;
       lt = cur.label + " · " + fmt(now < pre2 ? pre2 - now : now < cur.start ? cur.start - now : end2 - now);
       busyNow = now >= pre2;
     }
