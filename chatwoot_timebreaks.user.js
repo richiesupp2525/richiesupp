@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SG Перерывчики
 // @namespace    sparkmoth
-// @version      5.12
+// @version      5.14
 // @description  Перерывы, обед и конец смены: статус «Занят» по времени
 // @match        https://sparkmoth.com/app/*
 // @grant        none
@@ -11,7 +11,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "5.12"; // как в @version
+  const VERSION = "5.14"; // как в @version
 
   const LEAD_MIN = 5;          // за сколько минут до тб включать «занят»
   const BREAK_MIN = 10;
@@ -19,6 +19,8 @@
   const GUARD_BREAK_MIN = 0;   // за сколько минут до конца смены нельзя брать тб (0 - без ограничений)
   const GUARD_LUNCH_MIN = 30;  // то же для обеда
   const FIRE_EARLY_SEC = 10;   // запас на задержку запроса, потом подстраивается сам
+  const NIGHT_START_UTC = 19;  // с какого часа по UTC ночная смена
+  const DAY_START_UTC = 7;     // с какого часа по UTC дневная смена
   const USE_SERVER_TIME = true;
   const TOAST_MS = 20000;
   const RELOAD_AFTER_CHANGE = false;
@@ -590,7 +592,8 @@
     const p = (n) => String(n).padStart(2, "0");
     $("clk").textContent = p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
     const off = -d.getTimezoneOffset(), sg = off >= 0 ? "+" : "-", ao = Math.abs(off);
-    $("shift").textContent = d.getUTCHours() < 7 ? "Ночная SG" : "Дневная SG";
+    const uh = d.getUTCHours();
+    $("shift").textContent = uh >= NIGHT_START_UTC || uh < DAY_START_UTC ? "Ночная SG" : "Дневная SG";
     const shifted = clockSynced && Math.abs(clockOffset) >= 1000;
     const extra = shifted ? " · ПК " + (clockOffset > 0 ? "отстаёт" : "спешит") + " на " + (Math.abs(clockOffset) / 1000).toFixed(1) + " с (учтено)" : "";
     $("cltitle").textContent = shifted ? "Часы ПК со сверкой по серверу" : "Время берётся с часов компьютера";
