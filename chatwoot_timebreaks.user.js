@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chatwoot Status: Day Plan (v5 design)
 // @namespace    sparkmoth
-// @version      5.7
+// @version      5.9
 // @description  План ТБ и обеда, авто-"Занят" за 5 минут до начала, уведомления рядом с окном. Новый дизайн.
 // @match        https://sparkmoth.com/app/*
 // @grant        none
@@ -11,7 +11,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "5.7"; // держите в синхроне со строкой @version выше
+  const VERSION = "5.9"; // держите в синхроне со строкой @version выше
 
   // ===== НАСТРОЙКИ =====
   const LEAD_MIN = 5;      // за сколько минут до начала переходить в «Занят»
@@ -20,6 +20,7 @@
   const GUARD_LUNCH_MIN = 30;  // за сколько минут до конца смены нельзя брать обед (0 — можно в любое время)
   const LUNCH_MIN = 60;    // длительность обеда
   const FIRE_EARLY_SEC = 10; // запрос отправляется заранее, чтобы статус уже был «Занят» ровно за 5 минут (после первой смены подстраивается сам)
+  const USE_SERVER_TIME = true; // сверять часы ПК с временем сервера Chatwoot (если часы ПК спешат/отстают, поправка учитывается)
   const TOAST_MS = 20000;  // сколько показывать уведомление
   const RELOAD_AFTER_CHANGE = false; // true — перезагружать страницу после смены статуса (запасной вариант)
   // =====================
@@ -73,6 +74,34 @@
     if (!a.length) return FIRE_EARLY_SEC * 1000;
     return Math.min(30000, Math.max(2000, Math.max.apply(null, a) + 1500));
   }
+  // ---------- Сверка часов ПК с сервером ----------
+  let clockOffset = 0, clockSynced = false;
+  const nowMs = () => Date.now() + clockOffset;
+  async function syncClock() {
+    if (!USE_SERVER_TIME) return;
+    const samples = [];
+    for (let i = 0; i < 4; i++) {
+      try {
+        const t0 = Date.now();
+        const r = await fetch("/api/v1/profile?_=" + t0 + i, { cache: "no-store", headers: headers(getAuth()) });
+        const t1 = Date.now();
+        const dh = r.headers.get("Date");
+        if (dh) {
+          const mid = (t0 + t1) / 2;
+          // заголовок Date округлён вниз до секунды: смещение лежит в [lo, lo + 1000)
+          samples.push({ lo: Date.parse(dh) - mid, rtt: t1 - t0 });
+        }
+      } catch (e) {}
+      await new Promise((res) => setTimeout(res, 230 + i * 70));
+    }
+    if (!samples.length) return;
+    const lo = Math.max.apply(null, samples.map((x) => x.lo));
+    const hi = Math.min.apply(null, samples.map((x) => x.lo + 1000));
+    const raw = Math.round(lo < hi ? (lo + hi) / 2 : samples.sort((a, b) => a.rtt - b.rtt)[0].lo + 500);
+    // Заголовок Date точен только до секунды, поэтому мелкие расхождения (< 1 с) считаем шумом и не применяем
+    clockOffset = Math.abs(raw) >= 1000 ? raw : 0;
+    clockSynced = true;
+  }
   let lastLag = 0, lastEarly = 0; // на сколько мс позже планового момента сработал скрипт
   function getStore() {
     const app = document.querySelector("#app");
@@ -85,6 +114,7 @@
     const id = accountId();
     if (!id) return;
     const t0 = performance.now();
+    const sentAt = nowMs();
     let via = "api";
     // 1) Тот же путь, что и у кнопки статуса в самом Chatwoot: индикатор обновляется мгновенно
     const store = getStore();
@@ -115,7 +145,7 @@
     }
     const total = Math.max(req, ui || 0);
     const lat = read(LS_LAT, []); lat.push(total); write(LS_LAT, lat.slice(-5));
-    writeDiag({ what: status, lag: lastLag, req, ui, early: lastEarly, via, at: Date.now() });
+    writeDiag({ what: status, lag: lastLag, req, ui, early: lastEarly, via, at: sentAt });
     if (RELOAD_AFTER_CHANGE) setTimeout(() => location.reload(), 800);
   }
   function writeDiag(d) { write(LS_DIAG, d); try { renderDiag(); } catch (e) {} }
@@ -167,7 +197,7 @@
     const evs = todayEvents();
     if (!evs.length) return false;
     const st = getState();
-    const now = Date.now();
+    const now = nowMs();
     for (const e of evs) {
       const end = e.start + e.dur * 60000;
       if (e.blocked) continue; // за 3 минуты до конца смены ТБ и обед брать нельзя
@@ -210,7 +240,7 @@
   async function timerTick() {
     const t = read(LS_TIMER, null);
     if (!t) return false;
-    const now = Date.now();
+    const now = nowMs();
     if (t.busyAt && now >= t.busyAt) {
       lastLag = now - t.busyAt; lastEarly = 0;
       write(LS_TIMER, t.backMin > 0 ? { backAt: now + t.backMin * 60000 } : null);
@@ -356,7 +386,7 @@
 
       <div class="cwdp-clock">
         <span style="font-size:16px">🖥</span>
-        <div class="t"><b>Время берётся с часов компьютера</b><span id="tz"></span></div>
+        <div class="t"><b id="cltitle">Время берётся с часов компьютера</b><span id="tz"></span></div>
         <div class="n" id="clk">--:--:--</div>
       </div>
 
@@ -506,7 +536,7 @@
   let lastSig = "";
   function renderList(force) {
     const evs = todayEvents();
-    const now = Date.now();
+    const now = nowMs();
     const sig = evs.map((e) => e.id + e.start + (e.blocked ? "x" : "")).join("|");
     if (force || sig !== lastSig) {
       lastSig = sig;
@@ -584,12 +614,12 @@
   $("tstart").onclick = () => {
     const m = Number($("tb").value);
     if (!(m > 0)) return;
-    write(LS_TIMER, { busyAt: Date.now() + m * 60000, backMin: Number($("tr").value) || 0 });
+    write(LS_TIMER, { busyAt: nowMs() + m * 60000, backMin: Number($("tr").value) || 0 });
   };
   $("tstop").onclick = () => write(LS_TIMER, null);
   function renderTimer() {
     const t = read(LS_TIMER, null);
-    const now = Date.now();
+    const now = nowMs();
     $("tinfo").textContent = !t ? "" : t.busyAt ? "До «Занят»: " + fmt(t.busyAt - now) : "До «В сети»: " + fmt(t.backAt - now);
   }
 
@@ -597,11 +627,18 @@
   let tzName = "";
   try { tzName = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (e) {}
   function renderClock() {
-    const d = new Date();
+    const d = new Date(nowMs());
     const p = (n) => String(n).padStart(2, "0");
     $("clk").textContent = p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
     const off = -d.getTimezoneOffset(), sg = off >= 0 ? "+" : "-", ao = Math.abs(off);
-    $("tz").textContent = (tzName ? tzName + " · " : "") + "UTC" + sg + p(Math.floor(ao / 60)) + ":" + p(ao % 60);
+    let extra = "";
+    if (USE_SERVER_TIME) {
+      if (!clockSynced) extra = " · сверка с сервером…";
+      else if (Math.abs(clockOffset) < 1000) extra = " · сверено с сервером: ПК точный";
+      else extra = " · ПК " + (clockOffset > 0 ? "отстаёт" : "спешит") + " на " + (Math.abs(clockOffset) / 1000).toFixed(1) + " с (учтено)";
+    }
+    $("cltitle").textContent = clockSynced ? "Часы компьютера со сверкой по серверу" : "Время берётся с часов компьютера";
+    $("tz").textContent = (tzName ? tzName + " · " : "") + "UTC" + sg + p(Math.floor(ao / 60)) + ":" + p(ao % 60) + extra;
   }
 
   function renderDiag() {
@@ -610,7 +647,7 @@
     if (!d) { el.textContent = ""; return; }
     const t = new Date(d.at), p = (n) => String(n).padStart(2, "0");
     const name = { busy: "«Занят»", online: "«В сети»", offline: "«Оффлайн»" }[d.what] || d.what;
-    el.textContent = "Последнее переключение: " + name + " в " + p(t.getHours()) + ":" + p(t.getMinutes()) + ":" + p(t.getSeconds()) +
+    el.textContent = "Последнее переключение: " + name + " · отправлено в " + p(t.getHours()) + ":" + p(t.getMinutes()) + ":" + p(t.getSeconds()) +
       " · запрос " + (d.req / 1000).toFixed(1) + " с" + (d.ui != null ? " · индикатор " + (d.ui / 1000).toFixed(1) + " с" : "") +
       (d.early ? " · отправлено за " + (d.early / 1000).toFixed(1) + " с до срока" : "") + " · " + (d.via === "store" ? "через интерфейс" : "через API");
   }
@@ -623,15 +660,17 @@
     try { if (!(await eventsTick())) await timerTick(); }
     finally { lock = false; }
   }
-  function frame() {
-    const t = Date.now();
-    if (t - lastRender >= 900) {
-      lastRender = t;
-      renderList(false); renderTimer(); renderClock(); renderDiag(); renderToast(); positionAll();
-    }
-    logic();
+  function frame() { logic(); }
+  // Интерфейс обновляется точно на смене секунды, чтобы цифры совпадали с часами компьютера
+  function tickUI() {
+    renderList(false); renderTimer(); renderClock(); renderDiag(); renderToast(); positionAll();
+    setTimeout(tickUI, 1000 - (nowMs() % 1000) + 2);
   }
+
+  syncClock();
+  setInterval(syncClock, 10 * 60000);
   renderList(true);
+  tickUI();
   frame();
   // Основной тикер — Web Worker: браузер не замедляет его в фоновой вкладке (в отличие от setInterval на странице)
   try {
