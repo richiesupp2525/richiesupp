@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chatwoot Status: Day Plan (v5 design)
 // @namespace    sparkmoth
-// @version      5.9
+// @version      5.10
 // @description  План ТБ и обеда, авто-"Занят" за 5 минут до начала, уведомления рядом с окном. Новый дизайн.
 // @match        https://sparkmoth.com/app/*
 // @grant        none
@@ -11,7 +11,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "5.9"; // держите в синхроне со строкой @version выше
+  const VERSION = "5.10"; // держите в синхроне со строкой @version выше
 
   // ===== НАСТРОЙКИ =====
   const LEAD_MIN = 5;      // за сколько минут до начала переходить в «Занят»
@@ -32,7 +32,6 @@
   const LS_COLLAPSED = "cw_dp_collapsed";
   const LS_RETURN = "cw_dp_return";
   const LS_TIMER = "cw_dp_timer";
-  const LS_DIAG = "cw_dp_diag";
   const LS_LAT = "cw_dp_latency";
 
   const read = (k, def) => { try { const v = JSON.parse(localStorage.getItem(k)); return v == null ? def : v; } catch (e) { return def; } };
@@ -60,7 +59,6 @@
     const m = location.pathname.match(/\/accounts\/(\d+)/);
     return m ? Number(m[1]) : null;
   }
-  // Обновляет индикатор статуса в интерфейсе Chatwoot без перезагрузки страницы
   function refreshUi(status) {
     try {
       const app = document.querySelector("#app");
@@ -68,7 +66,6 @@
       if (store) store.dispatch("setCurrentUserAvailability", status);
     } catch (e) { console.warn("[Day Plan] не удалось обновить интерфейс", e); }
   }
-  // Насколько заранее отправлять запрос: максимум из последних измеренных задержек + запас
   function earlyMs() {
     const a = read(LS_LAT, []);
     if (!a.length) return FIRE_EARLY_SEC * 1000;
@@ -88,7 +85,6 @@
         const dh = r.headers.get("Date");
         if (dh) {
           const mid = (t0 + t1) / 2;
-          // заголовок Date округлён вниз до секунды: смещение лежит в [lo, lo + 1000)
           samples.push({ lo: Date.parse(dh) - mid, rtt: t1 - t0 });
         }
       } catch (e) {}
@@ -98,11 +94,9 @@
     const lo = Math.max.apply(null, samples.map((x) => x.lo));
     const hi = Math.min.apply(null, samples.map((x) => x.lo + 1000));
     const raw = Math.round(lo < hi ? (lo + hi) / 2 : samples.sort((a, b) => a.rtt - b.rtt)[0].lo + 500);
-    // Заголовок Date точен только до секунды, поэтому мелкие расхождения (< 1 с) считаем шумом и не применяем
     clockOffset = Math.abs(raw) >= 1000 ? raw : 0;
     clockSynced = true;
   }
-  let lastLag = 0, lastEarly = 0; // на сколько мс позже планового момента сработал скрипт
   function getStore() {
     const app = document.querySelector("#app");
     if (!app) return null;
@@ -114,9 +108,7 @@
     const id = accountId();
     if (!id) return;
     const t0 = performance.now();
-    const sentAt = nowMs();
     let via = "api";
-    // 1) Тот же путь, что и у кнопки статуса в самом Chatwoot: индикатор обновляется мгновенно
     const store = getStore();
     if (store) {
       try {
@@ -124,7 +116,6 @@
         if (store.getters.getCurrentUserAvailability === status) via = "store";
       } catch (e) { console.warn("[Day Plan] store:", e); }
     }
-    // 2) Запасной вариант: прямой запрос + ручное обновление индикатора
     if (via !== "store") {
       const r = await fetch("/api/v1/profile/availability", {
         method: "POST",
@@ -135,7 +126,6 @@
       refreshUi(status);
     }
     const req = Math.round(performance.now() - t0);
-    // Ждём, пока индикатор в интерфейсе реально покажет новый статус (замеряем его задержку)
     let ui = null;
     if (store && typeof store.getters.getCurrentUserAvailability === "string") {
       while (store.getters.getCurrentUserAvailability !== status && performance.now() - t0 < 12000) {
@@ -145,10 +135,8 @@
     }
     const total = Math.max(req, ui || 0);
     const lat = read(LS_LAT, []); lat.push(total); write(LS_LAT, lat.slice(-5));
-    writeDiag({ what: status, lag: lastLag, req, ui, early: lastEarly, via, at: sentAt });
     if (RELOAD_AFTER_CHANGE) setTimeout(() => location.reload(), 800);
   }
-  function writeDiag(d) { write(LS_DIAG, d); try { renderDiag(); } catch (e) {} }
   async function safe(status) {
     try { await setStatus(status); }
     catch (e) { console.error("[Day Plan]", e); toast("⚠️ Не удалось сменить статус: " + e.message, "err"); }
@@ -200,13 +188,11 @@
     const now = nowMs();
     for (const e of evs) {
       const end = e.start + e.dur * 60000;
-      if (e.blocked) continue; // за 3 минуты до конца смены ТБ и обед брать нельзя
+      if (e.blocked) continue;
       const s = st.done[e.id] || (st.done[e.id] = {});
       if (e.type === "shift") {
-        // Конец смены: «Занят» именно в указанное время (без 5 минут), возврата в «В сети» нет
         if (!s.busy && now >= e.start && now < e.start + 3 * 60000) {
           s.busy = true; s.end = true; write(LS_STATE, st);
-          lastLag = now - e.start; lastEarly = 0;
           toast("🏁 Конец смены (" + hhmm(e.start) + "). Перехожу в «Занят»", "busy");
           await safe("busy");
           return true;
@@ -217,7 +203,6 @@
       const fireAt = e.start - LEAD_MIN * 60000 - early;
       if (!s.busy && now >= fireAt && now < end) {
         s.busy = true; write(LS_STATE, st);
-        lastLag = now - fireAt; lastEarly = early;
         const left = Math.round((e.start - now) / 60000);
         toast((e.type === "lunch" ? "🍽 " : "☕ ") + e.label + (left > 0 ? " через " + left + " мин (" + hhmm(e.start) + ")" : " идёт") + ". Перехожу в «Занят»", "busy");
         await safe("busy");
@@ -225,7 +210,6 @@
       }
       if (now >= end && !s.end) {
         s.end = true; write(LS_STATE, st);
-        lastLag = now - end; lastEarly = 0;
         const nextSoon = evs.some((o) => o !== e && o.type !== "shift" && !o.blocked && now >= o.start - LEAD_MIN * 60000 && now < o.start + o.dur * 60000);
         if (s.busy && read(LS_RETURN, true) && !nextSoon) {
           toast("✅ " + e.label + " закончился. Возвращаю «В сети»", "ok");
@@ -242,14 +226,12 @@
     if (!t) return false;
     const now = nowMs();
     if (t.busyAt && now >= t.busyAt) {
-      lastLag = now - t.busyAt; lastEarly = 0;
       write(LS_TIMER, t.backMin > 0 ? { backAt: now + t.backMin * 60000 } : null);
       toast("⏱ Таймер: перехожу в «Занят»", "busy");
       await safe("busy");
       return true;
     }
     if (t.backAt && now >= t.backAt) {
-      lastLag = now - t.backAt; lastEarly = 0;
       write(LS_TIMER, null);
       toast("⏱ Таймер: возвращаю «В сети»", "ok");
       await safe("online");
@@ -291,8 +273,6 @@
   .cwdp-clock .t{flex:1;min-width:0;font-size:11px;line-height:1.3;color:#9a9aa8}
   .cwdp-clock .t b{display:block;font-size:11.5px;font-weight:600;color:#c4c4d0}
   .cwdp-clock .n{font:700 14px ui-monospace,Menlo,Consolas,monospace;color:#fff;font-variant-numeric:tabular-nums}
-  .cwdp-diag{font-size:10.5px;line-height:1.4;color:#7d7d8a;margin:-6px 2px 12px;min-height:0}
-  .cwdp-diag:empty{display:none}
   .cwdp-sec{font-size:11px;font-weight:600;color:#8d8d99;text-transform:uppercase;letter-spacing:.7px;margin:0 0 7px}
   .cwdp-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:7px;margin-bottom:10px}
   .cwdp-cell{margin:0!important;min-width:0;overflow:hidden;display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:10px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.06);transition:border-color .15s}
@@ -389,8 +369,6 @@
         <div class="t"><b id="cltitle">Время берётся с часов компьютера</b><span id="tz"></span></div>
         <div class="n" id="clk">--:--:--</div>
       </div>
-
-      <div class="cwdp-diag" id="diag"></div>
 
       <div class="cwdp-sec">Время на день</div>
       <div class="cwdp-grid">
@@ -555,7 +533,6 @@
       row.querySelector(".cwdp-chip").textContent = { done: "Готово", now: "Идёт", soon: "Скоро", wait: "Ожидает", blocked: "Нельзя" }[state];
     }
 
-    // Hero
     const hero = $("hero");
     const cur = evs.find((e) => !e.blocked && now < e.start + e.dur * 60000);
     if (!evs.length) {
@@ -598,7 +575,6 @@
       }
     }
 
-    // Текст на кнопке справа от «SG»
     let lt = "Перерывчики", busyNow = false;
     if (evs.length && !cur) lt = "ТБ ✓";
     else if (cur) {
@@ -623,7 +599,6 @@
     $("tinfo").textContent = !t ? "" : t.busyAt ? "До «Занят»: " + fmt(t.busyAt - now) : "До «В сети»: " + fmt(t.backAt - now);
   }
 
-  // Часы компьютера (по ним считаются все перерывы)
   let tzName = "";
   try { tzName = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (e) {}
   function renderClock() {
@@ -631,25 +606,10 @@
     const p = (n) => String(n).padStart(2, "0");
     $("clk").textContent = p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
     const off = -d.getTimezoneOffset(), sg = off >= 0 ? "+" : "-", ao = Math.abs(off);
-    let extra = "";
-    if (USE_SERVER_TIME) {
-      if (!clockSynced) extra = " · сверка с сервером…";
-      else if (Math.abs(clockOffset) < 1000) extra = " · сверено с сервером: ПК точный";
-      else extra = " · ПК " + (clockOffset > 0 ? "отстаёт" : "спешит") + " на " + (Math.abs(clockOffset) / 1000).toFixed(1) + " с (учтено)";
-    }
-    $("cltitle").textContent = clockSynced ? "Часы компьютера со сверкой по серверу" : "Время берётся с часов компьютера";
+    const shifted = clockSynced && Math.abs(clockOffset) >= 1000;
+    const extra = shifted ? " · ПК " + (clockOffset > 0 ? "отстаёт" : "спешит") + " на " + (Math.abs(clockOffset) / 1000).toFixed(1) + " с (учтено)" : "";
+    $("cltitle").textContent = shifted ? "Часы ПК со сверкой по серверу" : "Время берётся с часов компьютера";
     $("tz").textContent = (tzName ? tzName + " · " : "") + "UTC" + sg + p(Math.floor(ao / 60)) + ":" + p(ao % 60) + extra;
-  }
-
-  function renderDiag() {
-    const d = read(LS_DIAG, null);
-    const el = $("diag");
-    if (!d) { el.textContent = ""; return; }
-    const t = new Date(d.at), p = (n) => String(n).padStart(2, "0");
-    const name = { busy: "«Занят»", online: "«В сети»", offline: "«Оффлайн»" }[d.what] || d.what;
-    el.textContent = "Последнее переключение: " + name + " · отправлено в " + p(t.getHours()) + ":" + p(t.getMinutes()) + ":" + p(t.getSeconds()) +
-      " · запрос " + (d.req / 1000).toFixed(1) + " с" + (d.ui != null ? " · индикатор " + (d.ui / 1000).toFixed(1) + " с" : "") +
-      (d.early ? " · отправлено за " + (d.early / 1000).toFixed(1) + " с до срока" : "") + " · " + (d.via === "store" ? "через интерфейс" : "через API");
   }
 
   // ---------- Запуск ----------
@@ -661,9 +621,8 @@
     finally { lock = false; }
   }
   function frame() { logic(); }
-  // Интерфейс обновляется точно на смене секунды, чтобы цифры совпадали с часами компьютера
   function tickUI() {
-    renderList(false); renderTimer(); renderClock(); renderDiag(); renderToast(); positionAll();
+    renderList(false); renderTimer(); renderClock(); renderToast(); positionAll();
     setTimeout(tickUI, 1000 - (nowMs() % 1000) + 2);
   }
 
@@ -672,11 +631,9 @@
   renderList(true);
   tickUI();
   frame();
-  // Основной тикер — Web Worker: браузер не замедляет его в фоновой вкладке (в отличие от setInterval на странице)
   try {
     const w = new Worker(URL.createObjectURL(new Blob(["setInterval(function(){postMessage(1)},250)"], { type: "text/javascript" })));
     w.onmessage = frame;
   } catch (e) { console.warn("[Day Plan] Worker недоступен, используется обычный таймер", e); }
-  // Страховка на случай, если Worker заблокирован политикой сайта
   setInterval(frame, 1000);
 })();
