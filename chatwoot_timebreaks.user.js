@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Chatwoot Status: Day Plan (v5 design)
+// @name         SG Перерывчики
 // @namespace    sparkmoth
-// @version      5.10
-// @description  План ТБ и обеда, авто-"Занят" за 5 минут до начала, уведомления рядом с окном. Новый дизайн.
+// @version      5.12
+// @description  Перерывы, обед и конец смены: статус «Занят» по времени
 // @match        https://sparkmoth.com/app/*
 // @grant        none
 // @run-at       document-idle
@@ -11,25 +11,21 @@
 (function () {
   "use strict";
 
-  const VERSION = "5.10"; // держите в синхроне со строкой @version выше
+  const VERSION = "5.12"; // как в @version
 
-  // ===== НАСТРОЙКИ =====
-  const LEAD_MIN = 5;      // за сколько минут до начала переходить в «Занят»
-  const BREAK_MIN = 10;    // длительность перерыва
-  const GUARD_BREAK_MIN = 0;   // за сколько минут до конца смены нельзя брать ТБ (0 — можно в любое время)
-  const GUARD_LUNCH_MIN = 30;  // за сколько минут до конца смены нельзя брать обед (0 — можно в любое время)
-  const LUNCH_MIN = 60;    // длительность обеда
-  const FIRE_EARLY_SEC = 10; // запрос отправляется заранее, чтобы статус уже был «Занят» ровно за 5 минут (после первой смены подстраивается сам)
-  const USE_SERVER_TIME = true; // сверять часы ПК с временем сервера Chatwoot (если часы ПК спешат/отстают, поправка учитывается)
-  const TOAST_MS = 20000;  // сколько показывать уведомление
-  const RELOAD_AFTER_CHANGE = false; // true — перезагружать страницу после смены статуса (запасной вариант)
-  // =====================
+  const LEAD_MIN = 5;          // за сколько минут до тб включать «занят»
+  const BREAK_MIN = 10;
+  const LUNCH_MIN = 60;
+  const GUARD_BREAK_MIN = 0;   // за сколько минут до конца смены нельзя брать тб (0 - без ограничений)
+  const GUARD_LUNCH_MIN = 30;  // то же для обеда
+  const FIRE_EARLY_SEC = 10;   // запас на задержку запроса, потом подстраивается сам
+  const USE_SERVER_TIME = true;
+  const TOAST_MS = 20000;
+  const RELOAD_AFTER_CHANGE = false;
 
   const LS_PLAN = "cw_dp_plan";
   const LS_STATE = "cw_dp_state";
   const LS_TOAST = "cw_dp_toast";
-  const LS_POS = "cw_dp_pos";
-  const LS_COLLAPSED = "cw_dp_collapsed";
   const LS_RETURN = "cw_dp_return";
   const LS_TIMER = "cw_dp_timer";
   const LS_LAT = "cw_dp_latency";
@@ -37,7 +33,6 @@
   const read = (k, def) => { try { const v = JSON.parse(localStorage.getItem(k)); return v == null ? def : v; } catch (e) { return def; } };
   const write = (k, v) => (v == null ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)));
 
-  // ---------- API ----------
   function getAuth() {
     const m = document.cookie.match(/(?:^|;\s*)cw_d_session_info=([^;]+)/);
     if (!m) throw new Error("нет cookie сессии");
@@ -64,14 +59,13 @@
       const app = document.querySelector("#app");
       const store = app && app.__vue_app__ && app.__vue_app__.config.globalProperties.$store;
       if (store) store.dispatch("setCurrentUserAvailability", status);
-    } catch (e) { console.warn("[Day Plan] не удалось обновить интерфейс", e); }
+    } catch (e) { console.warn("не удалось обновить интерфейс", e); }
   }
   function earlyMs() {
     const a = read(LS_LAT, []);
     if (!a.length) return FIRE_EARLY_SEC * 1000;
     return Math.min(30000, Math.max(2000, Math.max.apply(null, a) + 1500));
   }
-  // ---------- Сверка часов ПК с сервером ----------
   let clockOffset = 0, clockSynced = false;
   const nowMs = () => Date.now() + clockOffset;
   async function syncClock() {
@@ -114,7 +108,7 @@
       try {
         await store.dispatch("updateAvailability", { availability: status, account_id: id });
         if (store.getters.getCurrentUserAvailability === status) via = "store";
-      } catch (e) { console.warn("[Day Plan] store:", e); }
+      } catch (e) { console.warn(e); }
     }
     if (via !== "store") {
       const r = await fetch("/api/v1/profile/availability", {
@@ -139,13 +133,11 @@
   }
   async function safe(status) {
     try { await setStatus(status); }
-    catch (e) { console.error("[Day Plan]", e); toast("⚠️ Не удалось сменить статус: " + e.message, "err"); }
+    catch (e) { console.error(e); toast("⚠️ Не удалось сменить статус: " + e.message, "err"); }
   }
 
-  // ---------- Уведомление ----------
   function toast(text, kind) { write(LS_TOAST, { text, kind: kind || "info", until: Date.now() + TOAST_MS, id: Date.now() }); renderToast(); }
 
-  // ---------- Помощники ----------
   const hhmm = (ts) => { const d = new Date(ts); return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); };
   const fmt = (ms) => {
     const s = Math.max(0, Math.ceil(ms / 1000));
@@ -240,7 +232,6 @@
     return false;
   }
 
-  // ---------- Стили ----------
   const css = `
   .cwdp{display:none;position:fixed;z-index:99999;width:292px;overflow-y:auto;overscroll-behavior:contain;box-sizing:border-box;color:#ececf1;font:13px/1.35 -apple-system,"Segoe UI",Inter,system-ui,sans-serif;
     background:rgba(24,24,29,.86);backdrop-filter:blur(18px) saturate(1.4);-webkit-backdrop-filter:blur(18px) saturate(1.4);
@@ -343,7 +334,6 @@
   style.textContent = css;
   document.head.appendChild(style);
 
-  // ---------- Разметка ----------
   const svgClock = '<svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
   const svgChev = '<svg class="cwdp-chev" viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
   const cell = (i, label, kind) => `<label class="cwdp-cell${kind ? " wide" : ""}"><i class="cwdp-dot${kind === "shift" ? " s" : kind ? " l" : ""}"></i><span>${label}</span><input id="p${i}" type="time"></label>`;
@@ -370,7 +360,7 @@
         <div class="n" id="clk">--:--:--</div>
       </div>
 
-      <div class="cwdp-sec">Время на день</div>
+      <div class="cwdp-sec" id="shift">Дневная SG</div>
       <div class="cwdp-grid">
         ${cell(0, "ТБ 1")}${cell(1, "ТБ 2")}${cell(2, "ТБ 3")}${cell(3, "ТБ 4")}${cell(4, "Обед", true)}${cell(5, "Конец смены", "shift")}
       </div>
@@ -401,7 +391,6 @@
   document.body.appendChild(toastEl);
   const $ = (id) => (id === "toast" ? toastEl : box.querySelector("#" + id));
 
-  // ---------- Кнопка-лаунчер справа от «SG» ----------
   const launch = document.createElement("div");
   launch.className = "cwdp-launch";
   launch.setAttribute("role", "button");
@@ -410,7 +399,6 @@
   document.body.appendChild(launch);
   const launchText = launch.querySelector("span");
 
-  // ---------- Позиция: справа от надписи «SG», раскрывается по клику ----------
   let sgEl = null, lastSearch = 0;
   function findSG() {
     for (const el of document.querySelectorAll("body *")) {
@@ -456,7 +444,6 @@
   window.addEventListener("resize", positionAll);
   setInterval(positionAll, 400);
 
-  // ---------- Уведомление ----------
   let lastToastId = null;
   function renderToast() {
     const t = read(LS_TOAST, null);
@@ -484,7 +471,6 @@
   }
   $("toast").onclick = () => { write(LS_TOAST, null); renderToast(); };
 
-  // ---------- План ----------
   const plan = read(LS_PLAN, null);
   if (plan) { (plan.b || []).forEach((t, i) => ($("p" + i).value = t || "")); $("p4").value = plan.l || ""; $("p5").value = plan.e || ""; }
   $("save").onclick = () => {
@@ -510,7 +496,6 @@
   $("ret").checked = !!read(LS_RETURN, true);
   $("ret").onchange = (e) => write(LS_RETURN, e.target.checked);
 
-  // ---------- Список и «hero» ----------
   let lastSig = "";
   function renderList(force) {
     const evs = todayEvents();
@@ -586,7 +571,6 @@
     launch.classList.toggle("busy", busyNow);
   }
 
-  // ---------- Простой таймер ----------
   $("tstart").onclick = () => {
     const m = Number($("tb").value);
     if (!(m > 0)) return;
@@ -606,14 +590,14 @@
     const p = (n) => String(n).padStart(2, "0");
     $("clk").textContent = p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
     const off = -d.getTimezoneOffset(), sg = off >= 0 ? "+" : "-", ao = Math.abs(off);
+    $("shift").textContent = d.getUTCHours() < 7 ? "Ночная SG" : "Дневная SG";
     const shifted = clockSynced && Math.abs(clockOffset) >= 1000;
     const extra = shifted ? " · ПК " + (clockOffset > 0 ? "отстаёт" : "спешит") + " на " + (Math.abs(clockOffset) / 1000).toFixed(1) + " с (учтено)" : "";
     $("cltitle").textContent = shifted ? "Часы ПК со сверкой по серверу" : "Время берётся с часов компьютера";
     $("tz").textContent = (tzName ? tzName + " · " : "") + "UTC" + sg + p(Math.floor(ao / 60)) + ":" + p(ao % 60) + extra;
   }
 
-  // ---------- Запуск ----------
-  let lock = false, lastRender = 0;
+  let lock = false;
   async function logic() {
     if (lock) return;
     lock = true;
@@ -634,6 +618,6 @@
   try {
     const w = new Worker(URL.createObjectURL(new Blob(["setInterval(function(){postMessage(1)},250)"], { type: "text/javascript" })));
     w.onmessage = frame;
-  } catch (e) { console.warn("[Day Plan] Worker недоступен, используется обычный таймер", e); }
+  } catch (e) { console.warn("Worker недоступен, используется обычный таймер", e); }
   setInterval(frame, 1000);
 })();
