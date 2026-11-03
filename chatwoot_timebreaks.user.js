@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SG Перерывчики
 // @namespace    sparkmoth
-// @version      5.14
+// @version      5.15
 // @description  Перерывы, обед и конец смены: статус «Занят» по времени
 // @match        https://sparkmoth.com/app/*
 // @grant        none
@@ -11,7 +11,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "5.14"; // как в @version
+  const VERSION = "5.15"; // как в @version
 
   const LEAD_MIN = 5;          // за сколько минут до тб включать «занят»
   const BREAK_MIN = 10;
@@ -31,6 +31,7 @@
   const LS_RETURN = "cw_dp_return";
   const LS_TIMER = "cw_dp_timer";
   const LS_LAT = "cw_dp_latency";
+  const LS_1212 = "cw_dp_1212";
 
   const read = (k, def) => { try { const v = JSON.parse(localStorage.getItem(k)); return v == null ? def : v; } catch (e) { return def; } };
   const write = (k, v) => (v == null ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)));
@@ -151,6 +152,22 @@
 
   const guardMin = (e) => (e.type === "lunch" ? GUARD_LUNCH_MIN : GUARD_BREAK_MIN);
 
+  const kyivFmt = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Kiev", hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" });
+  function kyivOffset(ts) {
+    const p = {};
+    kyivFmt.formatToParts(ts).forEach((x) => (p[x.type] = x.value));
+    return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - Math.floor(ts / 1000) * 1000;
+  }
+  // начало смены 12-12: последние 12:00 по Киеву
+  function shiftBase(ts) {
+    const off = kyivOffset(ts);
+    const k = new Date(ts + off);
+    let wall = Date.UTC(k.getUTCFullYear(), k.getUTCMonth(), k.getUTCDate(), 12, 0, 0);
+    if (k.getUTCHours() < 12) wall -= 86400000;
+    return wall - kyivOffset(wall - off);
+  }
+  const is1212 = () => !!read(LS_1212, false);
+
   function todayEvents() {
     const plan = read(LS_PLAN, null);
     if (!plan) return [];
@@ -158,7 +175,16 @@
     const mk = (id, type, label, t, dur) => {
       if (!t) return;
       const [h, m] = t.split(":").map(Number);
-      const d = new Date(); d.setHours(h, m, 0, 0);
+      let d;
+      if (is1212()) {
+        const base = shiftBase(nowMs());
+        d = new Date(base);
+        d.setHours(h, m, 0, 0);
+        if (d.getTime() < base) d.setDate(d.getDate() + 1);
+      } else {
+        d = new Date();
+        d.setHours(h, m, 0, 0);
+      }
       out.push({ id, type, label, start: d.getTime(), dur });
     };
     (plan.b || []).forEach((t, i) => mk("b" + i, "break", "ТБ " + (i + 1), t, BREAK_MIN));
@@ -170,7 +196,7 @@
     return out;
   }
   function getState() {
-    const day = new Date().toDateString();
+    const day = is1212() ? "k" + shiftBase(nowMs()) : new Date().toDateString();
     const st = read(LS_STATE, null);
     return st && st.day === day ? st : { day, done: {} };
   }
@@ -363,6 +389,7 @@
       </div>
 
       <div class="cwdp-sec" id="shift">Дневная SG</div>
+      <label class="cwdp-sw" title="Смена с 12:00 до 24:00 по Киеву: время после полуночи считается следующими сутками"><span>12-12</span><input type="checkbox" id="m1212"><i></i></label>
       <div class="cwdp-grid">
         ${cell(0, "ТБ 1")}${cell(1, "ТБ 2")}${cell(2, "ТБ 3")}${cell(3, "ТБ 4")}${cell(4, "Обед", true)}${cell(5, "Конец смены", "shift")}
       </div>
@@ -497,6 +524,12 @@
   };
   $("ret").checked = !!read(LS_RETURN, true);
   $("ret").onchange = (e) => write(LS_RETURN, e.target.checked);
+  $("m1212").checked = is1212();
+  $("m1212").onchange = (e) => {
+    write(LS_1212, e.target.checked);
+    write(LS_STATE, null);
+    renderList(true);
+  };
 
   let lastSig = "";
   function renderList(force) {
