@@ -39,7 +39,7 @@
   const HELPDESK_ORIGIN = "https://" + HELPDESK_HOST;
   const TOP_ORIGIN = "https://" + TOP_HOST;
 
-  const AUTO_SUBMIT = true;        // false - только заполнить, отправите сами
+  const AUTO_SUBMIT = false;        // false - только заполнить, отправите сами
   const ADMIN_MAX_AGE_MIN = 60;    // свежесть данных, если ID клиента в Chatwoot найти не удалось (берётся последняя страница админки)
   const VERIFIED_MAX_AGE_MIN = 480; // свежесть данных, когда ID совпал с контактом в Chatwoot
   const FRESH_MIN = 10;            // если данные клиента моложе - страницу админки заново не открываем
