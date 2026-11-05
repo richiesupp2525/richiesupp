@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dep-tickets
 // @namespace    sparkmoth
-// @version      1.19
+// @version      1.22
 // @description  Одна кнопка в Chatwoot: данные клиента из админки + ссылка на PDF-чек из диалога -> тикет в HelpDesk
 // @match        https://sparkmoth.com/app/*
 // @match        https://hd.sparkmoth.com/*
@@ -29,6 +29,7 @@
 // @grant        GM_setValue
 // @grant        GM_openInTab
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      plevantis.net
 // @run-at       document-idle
 // ==/UserScript==
@@ -54,7 +55,7 @@
     "dy.boadmin.org", "mr.boadmin.org", "kn.boadmin.org", "rs.boadmin.org", "kt.boadmin.org", "ak.boadmin.org",
   ];
 
-  const VERSION = "1.19";
+  const VERSION = "1.22";
 
   // Команда в форме HelpDesk (поле «Команда»). Определяем по проекту из заметки и по домену админки
   const TEAM_BY_PROJECT = [
@@ -231,9 +232,31 @@
     return [L[0] || "", L[1] || "", link || "", ...rest].join("\n");
   }
 
+  // Приоритет по статусу клиента: VIP и HighRoll - Срочный, PriVIP - Высокий (остальные статусы не трогаем)
+  function clientStatus(note) {
+    const L = String(note || "").split("\n").map((x) => x.trim()).slice(3).filter(Boolean);
+    const st = L[0] || "";
+    return REQUIRED_SUMS.some(([re]) => re.test(st)) ? "" : st;
+  }
+  function priorityFor(status) {
+    if (/^(vip|high[\s-]?roll(er)?)$/i.test(status)) return { stem: "срочн", name: "Срочный" };
+    if (/^pri[\s-]?vip$/i.test(status)) return { stem: "высок", name: "Высокий" };
+    return null;
+  }
+
   // ---------- HelpDesk (внутри рамки): заполняем форму ----------
   if (location.hostname === HELPDESK_HOST) {
     const done = new Set();
+
+    // HelpDesk сообщает об ошибке через alert(): перехватываем текст, чтобы не считать неудачу успехом
+    let lastAlert = null;
+    try {
+      unsafeWindow.alert = function (m) { lastAlert = { text: String(m || ""), at: Date.now() }; };
+    } catch (e) {}
+    const lastTicketLink = () => {
+      const a = [...document.querySelectorAll("a")].find((x) => /Открыть тикет/i.test(x.textContent));
+      return a ? a.href + "|" + (a.parentElement ? a.parentElement.textContent.replace(/\s+/g, " ").trim() : "") : "";
+    };
 
     const findNote = () => {
       const label = [...document.querySelectorAll("label")].find((l) => l.textContent.includes("Приватная заметка"));
@@ -254,6 +277,29 @@
     }
 
     const norm = (t) => (t || "").replace(/\s+/g, " ").trim().toLowerCase();
+    function setSelect(el, value) {
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(el, value);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    // Выставляет приоритет в списке «Приоритет» по началу названия (срочн / высок). Возвращает "" или текст ошибки
+    async function setPriority(stem, name) {
+      const find = () => {
+        const label = [...document.querySelectorAll("label")].find((l) => norm(l.textContent).startsWith("приоритет"));
+        if (!label) return null;
+        const own = label.htmlFor && document.getElementById(label.htmlFor);
+        return own || (label.parentElement && label.parentElement.querySelector("select")) || null;
+      };
+      const el = await waitFor(find, 8000);
+      if (!(el instanceof HTMLSelectElement)) return "не нашёл список «Приоритет»";
+      const opt = [...el.options].find((o) => norm(o.textContent).startsWith(stem));
+      if (!opt) return "в списке «Приоритет» нет пункта «" + name + "»";
+      setSelect(el, opt.value);
+      await sleep(600);
+      const cur = find() || el;
+      const sel = cur.selectedOptions && cur.selectedOptions[0];
+      return sel && norm(sel.textContent).startsWith(stem) ? "" : "не удалось выставить приоритет «" + name + "»";
+    }
     const findTeamControl = () => {
       const label = [...document.querySelectorAll("label")].find((l) => norm(l.textContent).startsWith("команда"));
       if (!label) return null;
@@ -275,9 +321,7 @@
       if (el instanceof HTMLSelectElement) {
         const opt = [...el.options].find((o) => norm(o.textContent) === want);
         if (!opt) return "в списке «Команда» нет пункта «" + team + "»";
-        el.value = opt.value;
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        el.dispatchEvent(new Event("change", { bubbles: true }));
+        setSelect(el, opt.value);
       } else {
         const findOption = () => [...document.querySelectorAll("[role=option], li, option, div, span, button, a")]
           .find((n) => !n.children.length && norm(n.textContent) === want && n.offsetParent !== null && !el.contains(n) && !n.contains(el));
@@ -292,7 +336,9 @@
         fire(opt, ["mousedown", "mouseup", "click"]);
       }
       await sleep(600);
-      return norm(readTeam(findTeamControl() || el)) === want ? "" : "не удалось выбрать команду «" + team + "»";
+      if (norm(readTeam(findTeamControl() || el)) !== want) return "не удалось выбрать команду «" + team + "»";
+      await sleep(700); // значение не должно сброситься само
+      return norm(readTeam(findTeamControl() || el)) === want ? "" : "команда «" + team + "» сбросилась после выбора";
     }
 
     window.addEventListener("message", async (e) => {
@@ -312,15 +358,32 @@
         teamError = await setTeam(d.team);
         await sleep(300);
       }
+      let prioError = "";
+      if (d.priority) {
+        prioError = await setPriority(d.priority.stem, d.priority.name);
+        await sleep(300);
+      }
       const field = await waitFor(findNote, 8000);
       if (!field) return e.source.postMessage({ type: "cw-ticket-error", nonce: d.nonce, text: "Не нашёл поле «Приватная заметка»" }, e.origin);
       setValue(field, d.note);
       await sleep(400);
-      if (teamError) return e.source.postMessage({ type: "cw-ticket-error", nonce: d.nonce, text: "Заметка заполнена, но " + teamError + ". Выберите команду вручную и создайте тикет" }, e.origin);
+      const fieldError = teamError || prioError;
+      if (fieldError) return e.source.postMessage({ type: "cw-ticket-error", nonce: d.nonce, text: "Заметка заполнена, но " + fieldError + ". Исправьте поле вручную и создайте тикет" }, e.origin);
       if (d.submit) {
         const btn = findSubmit();
         if (!btn) return e.source.postMessage({ type: "cw-ticket-error", nonce: d.nonce, text: "Не нашёл кнопку «Создать тикет»" }, e.origin);
+        const before = lastTicketLink();
+        lastAlert = null;
         btn.click();
+        // ждём подтверждения: либо ошибка от HelpDesk, либо в блоке «Последний тикет» появился новый
+        const res = await waitFor(() => {
+          if (lastAlert && /не удалось|ошибк|error|fail|попробуйте/i.test(lastAlert.text)) return { err: lastAlert.text };
+          const now = lastTicketLink();
+          if (now && now !== before) return { ok: true };
+          return null;
+        }, 20000, 300);
+        if (!res) return e.source.postMessage({ type: "cw-ticket-error", nonce: d.nonce, text: "Не удалось подтвердить создание тикета (HelpDesk не показал ни ошибки, ни нового тикета)" + (lastAlert ? ": «" + lastAlert.text + "»" : "") + ". Проверьте на портале, прежде чем создавать повторно" }, e.origin);
+        if (res.err) return e.source.postMessage({ type: "cw-ticket-error", nonce: d.nonce, text: "HelpDesk не создал тикет: «" + res.err + "». Проверьте форму (команда, заметка) и повторите" }, e.origin);
       }
       e.source.postMessage({ type: "cw-ticket-done", nonce: d.nonce, submitted: !!d.submit }, e.origin);
     });
@@ -376,7 +439,7 @@
   // Уже создан ли тикет по этому чеку: своя отметка или заметка в диалоге со ссылкой на этот чек
   function findDuplicate(link, notes) {
     const key = linkKey(link);
-    const mine = GM_getValue("tickets", {})[key];
+    const mine = GM_getValue("tickets2", {})[key];
     const hit = notes.find((n) => n.content.includes(key));
     if (hit) return { at: hit.at * 1000, who: hit.who };
     if (mine) return { at: mine };
@@ -384,12 +447,12 @@
   }
   function markCreated(link) {
     if (!link) return;
-    const all = GM_getValue("tickets", {});
+    const all = GM_getValue("tickets2", {});
     all[linkKey(link)] = Date.now();
     const keys = Object.keys(all).sort((a, b) => all[b] - all[a]).slice(0, 100);
     const trimmed = {};
     keys.forEach((k) => (trimmed[k] = all[k]));
-    GM_setValue("tickets", trimmed);
+    GM_setValue("tickets2", trimmed);
   }
 
   // ---------- проверка дубля на портале тикетов ----------
@@ -694,6 +757,7 @@
       const tm = resolveTeam(project, cands);
       const team = tm.team;
       const submit = AUTO_SUBMIT && !!team;
+      const prio = priorityFor(clientStatus(note));
       toast("Открываю HelpDesk…", "busy", 0);
       let frame = findFrame();
       if (!frame) {
@@ -714,7 +778,7 @@
         window.addEventListener("message", onMsg);
         const send = () => {
           const f = findFrame();
-          if (f && f.contentWindow && !acked) f.contentWindow.postMessage({ type: "cw-ticket", nonce, note, team, submit }, HELPDESK_ORIGIN);
+          if (f && f.contentWindow && !acked) f.contentWindow.postMessage({ type: "cw-ticket", nonce, note, team, priority: prio, submit }, HELPDESK_ORIGIN);
         };
         const timer = setInterval(send, 700);
         const limit = setTimeout(() => finish({ type: "cw-ticket-error", text: "HelpDesk не ответил. Проверьте, что скрипт включён для " + HELPDESK_HOST }), 20000);
@@ -724,7 +788,7 @@
       if (result.type === "cw-ticket-error") throw new Error(result.text);
       if (result.submitted) markCreated(link);
       const who = clientId + (project ? " · " + project : "");
-      toast((result.submitted ? "Тикет отправлен: " : "Заметка заполнена, нажмите «Создать тикет»: ") + who + (team ? " → " + team : "") + (team ? "" : ". ВНИМАНИЕ: команду определить не удалось" + (tm.warn ? " (" + tm.warn + ")" : "") + ", выберите вручную; автоотправка отключена") + (link ? "" : " (без чека)") + (found.verified ? "" : ". ID не сверен с контактом, проверьте") + (found.stale ? ". Админка не залогинена, данные могли устареть" : "") + portalNote + " [v" + VERSION + ", автоотправка: " + (AUTO_SUBMIT ? "ВКЛ" : "выкл") + "]", "ok", 8000);
+      toast((result.submitted ? "Тикет отправлен: " : "Заметка заполнена, нажмите «Создать тикет»: ") + who + (team ? " → " + team : "") + (prio ? ", приоритет: " + prio.name : "") + (team ? "" : ". ВНИМАНИЕ: команду определить не удалось" + (tm.warn ? " (" + tm.warn + ")" : "") + ", выберите вручную; автоотправка отключена") + (link ? "" : " (без чека)") + (found.verified ? "" : ". ID не сверен с контактом, проверьте") + (found.stale ? ". Админка не залогинена, данные могли устареть" : "") + portalNote + " [v" + VERSION + ", автоотправка: " + (AUTO_SUBMIT ? "ВКЛ" : "выкл") + "]", "ok", 8000);
     } catch (e) {
       toast(e.message, "err", 9000);
     } finally {
