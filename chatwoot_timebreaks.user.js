@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SG Перерывчики
 // @namespace    sparkmoth
-// @version      5.15
+// @version      5.16
 // @description  Перерывы, обед и конец смены: статус «Занят» по времени
 // @match        https://sparkmoth.com/app/*
 // @grant        none
@@ -11,7 +11,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "5.15"; // как в @version
+  const VERSION = "5.16"; // как в @version
 
   const LEAD_MIN = 5;          // за сколько минут до тб включать «занят»
   const BREAK_MIN = 10;
@@ -192,7 +192,14 @@
     mk("e", "shift", "Конец смены", plan.e, 0);
     out.sort((a, b) => a.start - b.start);
     const shift = out.find((e) => e.type === "shift");
-    if (shift) out.forEach((e) => { if (e.type !== "shift" && guardMin(e) > 0 && e.start >= shift.start - guardMin(e) * 60000) e.blocked = true; });
+    if (shift) {
+      out.forEach((e) => {
+        if (e.type === "shift" || guardMin(e) <= 0) return;
+        let end = shift.start;
+        if (end < e.start) end += 86400000;
+        if (e.start >= end - guardMin(e) * 60000) e.blocked = true;
+      });
+    }
     return out;
   }
   function getState() {
