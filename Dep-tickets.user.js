@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dep-tickets
 // @namespace    sparkmoth
-// @version      1.22
+// @version      1.24
 // @description  Одна кнопка в Chatwoot: данные клиента из админки + ссылка на PDF-чек из диалога -> тикет в HelpDesk
 // @match        https://sparkmoth.com/app/*
 // @match        https://hd.sparkmoth.com/*
@@ -55,7 +55,7 @@
     "dy.boadmin.org", "mr.boadmin.org", "kn.boadmin.org", "rs.boadmin.org", "kt.boadmin.org", "ak.boadmin.org",
   ];
 
-  const VERSION = "1.22";
+  const VERSION = "1.24";
 
   // Команда в форме HelpDesk (поле «Команда»). Определяем по проекту из заметки и по домену админки
   const TEAM_BY_PROJECT = [
@@ -172,14 +172,22 @@
         }
         return "";
       };
+      // последний запасной способ: ищем подпись и значение «сумма EUR / сумма RUB (кол-во)» в тексте всей страницы
+      const VAL = "([\\d][\\d\\s.,]*[A-Z]{3}\\s*\\/\\s*[\\d][\\d\\s.,]*[A-Z]{3}\\s*\\(\\d+\\))";
+      const byText = (labelRe, out) => {
+        const m = clean(document.body.textContent).match(new RegExp(labelRe + "\\s*:?[^\\d]{0,20}" + VAL, "i"));
+        return m ? out + clean(m[1]) : "";
+      };
       const withdrawRe = /^Выводы через платеж/i, depositRe = /^Депозиты через платеж/i, manualRe = /^Ручные депозиты/i;
 
       let l1 = clean(text("#creditDebetTotals > dt:nth-child(1)") + " " + text("#creditDebetTotals > dd.text-danger"));
       if (!withdrawRe.test(l1)) l1 = byLabel(withdrawRe);
+      if (!withdrawRe.test(l1)) l1 = byText("Выводы через платеж\\S*\\s+систем\\S*", "Выводы через платежные системы: ");
       if (l1) totals.push(l1);
 
       let l2 = clean(text("#creditDebetTotals > dt:nth-child(9)") + " " + text("#creditDebetTotals > dd:nth-child(10)"));
       if (!depositRe.test(l2)) l2 = byLabel(depositRe);
+      if (!depositRe.test(l2)) l2 = byText("Депозиты через платеж\\S*\\s+систем\\S*", "Депозиты через платежную систему: ");
       if (l2) totals.push(l2);
 
       let manual = "";
@@ -189,6 +197,7 @@
         if (m) manual = clean(m[1]);
       }
       if (!manualRe.test(manual) || !/\d/.test(manual)) manual = byLabel(manualRe).replace(/^(Ручные депозиты:)\s*/i, "$1");
+      if (!manualRe.test(manual) || !/\d/.test(manual)) manual = byText("Ручные депозиты", "Ручные депозиты:");
       if (manual) totals.push(manual);
       if (status || totals.length) lines.push("");
       if (status) lines.push(status);
@@ -196,6 +205,13 @@
       return lines.join("\n").trim();
     }
 
+    // что видит скрипт на странице: попадает в сообщение об ошибке, если сумм нет
+    function diagnose() {
+      const root = document.querySelector("#creditDebetTotals");
+      const body = document.body.textContent;
+      return location.hostname + "; блок сумм: " + (root ? "есть (dt=" + root.querySelectorAll("dt").length + ")" : "нет") +
+        "; в тексте страницы: выводы=" + /Выводы через платеж/i.test(body) + ", депозиты=" + /Депозиты через платеж/i.test(body) + ", ручные=" + /Ручные депозиты/i.test(body);
+    }
     let published = "";
     function publish(force) {
       const header = adminHeader();
@@ -204,7 +220,7 @@
       if (header !== published || document.visibilityState === "visible") {
         published = header;
         const all = GM_getValue("headers", {});
-        all[id] = { text: header, at: Date.now() };
+        all[id] = { text: header, at: Date.now(), diag: diagnose() };
         const keys = Object.keys(all).sort((a, b) => all[b].at - all[a].at).slice(0, 20);
         const trimmed = {};
         keys.forEach((k) => (trimmed[k] = all[k]));
@@ -532,16 +548,17 @@
   }
 
   // Открывает страницу клиента в фоновой вкладке, ждёт пока скрипт админки сохранит данные, и закрывает вкладку
-  async function loadViaTab(c) {
+  async function loadViaTab(c, opts) {
+    opts = opts || {};
     const start = Date.now();
     const host = new URL(c.url).hostname;
     let tab = null;
-    try { tab = GM_openInTab(c.url, { active: false, insert: true, setParent: true }); } catch (e) { return null; }
+    try { tab = GM_openInTab(c.url, { active: !!opts.active, insert: true, setParent: true }); } catch (e) { return null; }
     const closeTab = () => { try { if (tab) tab.close(); } catch (e) {} };
     // суммы в админке догружаются поздно: пока есть статус, но нет сумм, ждём долго; без статуса тоже ждём подольше (статус мог не успеть)
     const needStable = (t) => (isPartial(t) ? 20000 : 4500);
     let text = "", changed = Date.now();
-    const end = Date.now() + 50000;
+    const end = Date.now() + (opts.total || 50000);
     while (Date.now() < end) {
       await sleep(500);
       const login = GM_getValue("adminLogin", null);
@@ -566,7 +583,13 @@
     let loginUrl = "";
     if (withUrl) {
       toast("Получаю данные клиента из админки…", "busy", 0);
-      const res = await loadViaTab(withUrl);
+      let res = await loadViaTab(withUrl);
+      // суммы не пришли в фоновой вкладке (часть страниц догружается только когда вкладка видима): повторяем на переднем плане
+      if (!res || (res.text && isPartial(res.text))) {
+        toast("Суммы не загрузились в фоновой вкладке, открываю страницу клиента на переднем плане…", "busy", 0);
+        const res2 = await loadViaTab(withUrl, { active: true, total: 45000 });
+        if (res2) res = res2;
+      }
       if (res && res.text) return { text: res.text, verified: true };
       if (res && res.login) loginUrl = withUrl.url;
     }
@@ -747,7 +770,10 @@
       const header = found.text;
       const [clientId, project] = header.split("\n").map((s) => s.trim());
       const lacking = missingSums(header);
-      if (lacking.length) throw new Error("Тикет не создан: в данных клиента нет обязательных строк (" + lacking.join(", ") + "). Откройте страницу клиента в админке, дождитесь загрузки сумм и нажмите кнопку снова");
+      if (lacking.length) {
+        const sd = GM_getValue("headers", {})[clientId];
+        throw new Error("Тикет не создан: в данных клиента нет обязательных строк (" + lacking.join(", ") + "). Откройте страницу клиента в админке, дождитесь загрузки сумм и нажмите кнопку снова" + (sd && sd.diag ? ". Диагностика: " + sd.diag : ""));
+      }
       if (!portalId && (await portalStep(clientId))) return;
 
 
