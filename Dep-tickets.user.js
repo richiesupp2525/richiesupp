@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dep-tickets
 // @namespace    sparkmoth
-// @version      1.24
+// @version      1.25
 // @description  Одна кнопка в Chatwoot: данные клиента из админки + ссылка на PDF-чек из диалога -> тикет в HelpDesk
 // @match        https://sparkmoth.com/app/*
 // @match        https://hd.sparkmoth.com/*
@@ -55,7 +55,7 @@
     "dy.boadmin.org", "mr.boadmin.org", "kn.boadmin.org", "rs.boadmin.org", "kt.boadmin.org", "ak.boadmin.org",
   ];
 
-  const VERSION = "1.24";
+  const VERSION = "1.25";
 
   // Команда в форме HelpDesk (поле «Команда»). Определяем по проекту из заметки и по домену админки
   const TEAM_BY_PROJECT = [
@@ -173,7 +173,7 @@
         return "";
       };
       // последний запасной способ: ищем подпись и значение «сумма EUR / сумма RUB (кол-во)» в тексте всей страницы
-      const VAL = "([\\d][\\d\\s.,]*[A-Z]{3}\\s*\\/\\s*[\\d][\\d\\s.,]*[A-Z]{3}\\s*\\(\\d+\\))";
+      const VAL = "([\\d][\\d\\s.,]*[A-Z]{3}(?:\\s*\\/\\s*[\\d][\\d\\s.,]*[A-Z]{3})?(?:\\s*\\(\\d+\\))?)";
       const byText = (labelRe, out) => {
         const m = clean(document.body.textContent).match(new RegExp(labelRe + "\\s*:?[^\\d]{0,20}" + VAL, "i"));
         return m ? out + clean(m[1]) : "";
@@ -209,7 +209,8 @@
     function diagnose() {
       const root = document.querySelector("#creditDebetTotals");
       const body = document.body.textContent;
-      return location.hostname + "; блок сумм: " + (root ? "есть (dt=" + root.querySelectorAll("dt").length + ")" : "нет") +
+      const labels = root ? [...root.querySelectorAll("dt")].slice(0, 14).map((d) => d.textContent.replace(/\s+/g, " ").trim().slice(0, 28)).join(" | ") : "";
+      return location.hostname + "; блок сумм: " + (root ? "есть (dt=" + root.querySelectorAll("dt").length + ": " + labels + ")" : "нет") +
         "; в тексте страницы: выводы=" + /Выводы через платеж/i.test(body) + ", депозиты=" + /Депозиты через платеж/i.test(body) + ", ручные=" + /Ручные депозиты/i.test(body);
     }
     let published = "";
@@ -310,6 +311,8 @@
       if (!(el instanceof HTMLSelectElement)) return "не нашёл список «Приоритет»";
       const opt = [...el.options].find((o) => norm(o.textContent).startsWith(stem));
       if (!opt) return "в списке «Приоритет» нет пункта «" + name + "»";
+      const have = el.selectedOptions && el.selectedOptions[0];
+      if (have && norm(have.textContent).startsWith(stem)) return "";
       setSelect(el, opt.value);
       await sleep(600);
       const cur = find() || el;
@@ -327,34 +330,67 @@
       if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return el.value;
       return el.textContent;
     };
-    const fire = (n, types) => types.forEach((t) => n.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })));
-    // Выбирает команду в форме. Возвращает "" при успехе или текст ошибки
+    const ALL_TEAMS = [...new Set(Object.values(TEAM_BY_HOST))].map(norm);
+    const teamIs = (el, want) => {
+      const t = norm(readTeam(el));
+      if (t === want) return true;
+      if (el instanceof HTMLSelectElement || el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return false;
+      return t.includes(want) && !ALL_TEAMS.some((x) => x !== want && t.includes(x)); // кастомный список: рядом с названием может быть лишний текст
+    };
+    // position:fixed и порталы дают offsetParent=null, поэтому видимость проверяем по размерам
+    const visible = (n) => n.getClientRects().length > 0;
+    const fire = (n, types) => types.forEach((t) => {
+      const Ev = /^pointer/.test(t) && window.PointerEvent ? PointerEvent : MouseEvent;
+      n.dispatchEvent(new Ev(t, { bubbles: true, cancelable: true, view: window }));
+    });
+    const CLICK = ["pointerdown", "mousedown", "pointerup", "mouseup", "click"];
+    const key = (n, k) => ["keydown", "keyup"].forEach((t) => n.dispatchEvent(new KeyboardEvent(t, { key: k, code: k, bubbles: true, cancelable: true })));
+    // Выбирает команду в форме. Возвращает "" при успехе или текст ошибки. Если уже выбрана - ничего не делает
     async function setTeam(team) {
-      const el = await waitFor(findTeamControl, 8000);
-      if (!el) return "не нашёл поле «Команда»";
       const want = norm(team);
-      if (norm(readTeam(el)) === want) return "";
-      if (el instanceof HTMLSelectElement) {
-        const opt = [...el.options].find((o) => norm(o.textContent) === want);
-        if (!opt) return "в списке «Команда» нет пункта «" + team + "»";
-        setSelect(el, opt.value);
-      } else {
-        const findOption = () => [...document.querySelectorAll("[role=option], li, option, div, span, button, a")]
-          .find((n) => !n.children.length && norm(n.textContent) === want && n.offsetParent !== null && !el.contains(n) && !n.contains(el));
-        el.focus();
-        fire(el, ["mousedown", "mouseup", "click"]);
-        let opt = await waitFor(findOption, 1500);
-        if (!opt && (el instanceof HTMLInputElement) && !el.readOnly) {
-          setValue(el, team);
-          opt = await waitFor(findOption, 1500);
+      let last = "";
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const el = await waitFor(findTeamControl, 8000);
+        if (!el) return "не нашёл поле «Команда»";
+        if (teamIs(el, want)) return "";
+        if (el instanceof HTMLSelectElement) {
+          const opt = [...el.options].find((o) => norm(o.textContent) === want);
+          if (!opt) return "в списке «Команда» нет пункта «" + team + "»";
+          setSelect(el, opt.value);
+        } else {
+          // самый глубокий видимый элемент с точным текстом команды (список может быть в портале, обёрнут в несколько тегов)
+          const findOption = () => {
+            const all = [...document.querySelectorAll("[role=option], option, li, div, span, button, a, p")]
+              .filter((n) => norm(n.textContent) === want && visible(n) && !el.contains(n) && !n.contains(el));
+            return all.find((n) => !all.some((m) => m !== n && n.contains(m))) || null;
+          };
+          el.focus();
+          fire(el, CLICK);
+          let opt = await waitFor(findOption, 1500);
+          if (!opt && (el instanceof HTMLInputElement) && !el.readOnly) {
+            setValue(el, team);
+            opt = await waitFor(findOption, 1500);
+            if (!opt) { key(el, "ArrowDown"); key(el, "Enter"); }
+          }
+          if (opt) {
+            fire(opt, CLICK);
+          } else if (!(el instanceof HTMLInputElement)) {
+            last = "не нашёл пункт «" + team + "» в списке «Команда»";
+            await sleep(500);
+            continue;
+          }
         }
-        if (!opt) return "не нашёл пункт «" + team + "» в списке «Команда»";
-        fire(opt, ["mousedown", "mouseup", "click"]);
+        await sleep(700);
+        const cur = findTeamControl() || el;
+        if (teamIs(cur, want)) {
+          await sleep(700); // значение не должно сброситься само
+          if (teamIs(findTeamControl() || cur, want)) return "";
+          last = "команда «" + team + "» сбросилась после выбора";
+        } else {
+          last = "не удалось выбрать команду «" + team + "» (в поле: «" + norm(readTeam(cur)).slice(0, 40) + "»)";
+        }
       }
-      await sleep(600);
-      if (norm(readTeam(findTeamControl() || el)) !== want) return "не удалось выбрать команду «" + team + "»";
-      await sleep(700); // значение не должно сброситься само
-      return norm(readTeam(findTeamControl() || el)) === want ? "" : "команда «" + team + "» сбросилась после выбора";
+      return last;
     }
 
     window.addEventListener("message", async (e) => {
@@ -369,26 +405,31 @@
       const lack = noteProblems(d.note);
       if (lack.length) return e.source.postMessage({ type: "cw-ticket-error", nonce: d.nonce, text: "Тикет не создан: заметка не по формату (" + lack.join("; ") + ")" }, e.origin);
 
-      let teamError = "";
-      if (d.team) {
-        teamError = await setTeam(d.team);
-        await sleep(300);
-      }
-      let prioError = "";
-      if (d.priority) {
-        prioError = await setPriority(d.priority.stem, d.priority.name);
-        await sleep(300);
-      }
+      const applyFields = async () => {
+        let err = "";
+        if (d.team) err = await setTeam(d.team);
+        if (!err && d.priority) err = await setPriority(d.priority.stem, d.priority.name);
+        return err;
+      };
+      let fieldError = await applyFields();
+      await sleep(300);
       const field = await waitFor(findNote, 8000);
       if (!field) return e.source.postMessage({ type: "cw-ticket-error", nonce: d.nonce, text: "Не нашёл поле «Приватная заметка»" }, e.origin);
       setValue(field, d.note);
-      await sleep(400);
-      const fieldError = teamError || prioError;
+      await sleep(500);
+      // форма могла перерисоваться и сбросить поля: проверяем команду, приоритет и заметку ещё раз прямо перед отправкой
+      if (!fieldError) fieldError = await applyFields();
+      const f2 = findNote();
+      if (f2 && f2.value !== d.note) { setValue(f2, d.note); await sleep(300); }
+      const f3 = findNote();
+      if (!fieldError && (!f3 || f3.value !== d.note)) fieldError = "заметка в форме не сохранилась";
       if (fieldError) return e.source.postMessage({ type: "cw-ticket-error", nonce: d.nonce, text: "Заметка заполнена, но " + fieldError + ". Исправьте поле вручную и создайте тикет" }, e.origin);
       if (d.submit) {
         const btn = findSubmit();
         if (!btn) return e.source.postMessage({ type: "cw-ticket-error", nonce: d.nonce, text: "Не нашёл кнопку «Создать тикет»" }, e.origin);
         const before = lastTicketLink();
+        const ERR_RE = /не удалось создать тикет/i;
+        const errBefore = ERR_RE.test(document.body.innerText || "");
         lastAlert = null;
         btn.click();
         // ждём подтверждения: либо ошибка от HelpDesk, либо в блоке «Последний тикет» появился новый
@@ -396,6 +437,7 @@
           if (lastAlert && /не удалось|ошибк|error|fail|попробуйте/i.test(lastAlert.text)) return { err: lastAlert.text };
           const now = lastTicketLink();
           if (now && now !== before) return { ok: true };
+          if (!errBefore && ERR_RE.test(document.body.innerText || "")) return { err: "Не удалось создать тикет" };
           return null;
         }, 20000, 300);
         if (!res) return e.source.postMessage({ type: "cw-ticket-error", nonce: d.nonce, text: "Не удалось подтвердить создание тикета (HelpDesk не показал ни ошибки, ни нового тикета)" + (lastAlert ? ": «" + lastAlert.text + "»" : "") + ". Проверьте на портале, прежде чем создавать повторно" }, e.origin);
